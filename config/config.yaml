@@ -1,0 +1,12 @@
+domain_name: "example-domain"
+phase2:
+  seeds: ["https://example.com/docs"]
+  out_path: "data/processed/web_chunks.jsonl"
+  out_format: "jsonl"
+  backend: "local"           # local (httpx+trafilatura) | firecrawl (cloud)
+  firecrawl_api_key_env: "FIRECRAWL_API_KEY"
+  max_pages: 200
+  same_domain_only: true
+  target_tokens: 550
+  overlap_pct: 0.12
+  min_content_chars: 200

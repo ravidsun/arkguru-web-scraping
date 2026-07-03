@@ -1,0 +1,10 @@
+# Phase 2 - Web scraping (local-first, cloud-optional)
+httpx>=0.27
+trafilatura>=1.9         # boilerplate removal + HTML->text/markdown (local backend)
+selectolax>=0.3          # fast HTML parsing
+markdownify>=0.13        # HTML -> markdown
+tiktoken>=0.7
+pyyaml>=6.0
+datasketch>=1.6          # MinHash near-duplicate detection
+# --- cloud-optional ---
+# firecrawl-py>=1.0      # managed crawl/scrape (set FIRECRAWL_API_KEY)

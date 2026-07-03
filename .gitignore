@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+data/raw_pdfs/*
+data/interim/*
+data/processed/*
+!data/**/.gitkeep
+artifacts/
+*.gguf
+*.parquet
+.venv/
