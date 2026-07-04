@@ -1,32 +1,107 @@
-# Phase 2 — Web Scraping & Data Collection
+# arkguru-web-scraping — Phase 2
 
-Crawl websites and convert them into the **same** portable `Chunk` schema as
-Phase 1, so both feed Phase 3 with zero glue. Independent process, different
-inputs (URLs), identical outputs. Local-first, cloud-optional.
+Crawl websites and convert them into the **same** `Chunk` records as Phase 1, so
+both feed Phase 3 with zero conversion. Independent process (different inputs —
+URLs instead of PDFs), identical output schema. **Local-first, cloud-optional.**
+Part of a 3-repo system with
+[`arkguru-pdf-extraction`](https://github.com/ravidsun/arkguru-pdf-extraction)
+(Phase 1) and
+[`arkguru-rag-slm`](https://github.com/ravidsun/arkguru-rag-slm) (Phase 3).
 
-## What it does
-- Crawl seed URLs (same-domain frontier, `max_pages` cap)
-- Extract clean content with `trafilatura` (removes nav/ads/boilerplate) → markdown
-- Structure-aware chunking (shared `common/chunking.py`, same sizing as Phase 1)
-- Near-duplicate removal via MinHash LSH (`datasketch`)
-- Metadata: URL, domain, title, section
+---
 
-## Backends
+## How it works (the logic)
+
+One flow in `phase2_web/pipeline.py`: **crawl → extract → chunk → dedup → write.**
+
+**1. Crawl frontier.**
+Starting from `seeds`, a breadth-first queue visits pages up to `max_pages`.
+Discovered links are enqueued; if `same_domain_only` is set, off-domain links are
+dropped. The frontier policy (path prefixes, robots.txt, priorities) is left as a
+marked `TODO` because it's a per-site decision.
+
+**2. Fetch + extract.**
+Two interchangeable backends return `(markdown, title, links)`:
+
 | Backend | Deps | Use |
 |---|---|---|
-| `local` (default) | httpx + trafilatura + selectolax | static sites, no keys |
-| `firecrawl` | `FIRECRAWL_API_KEY` | JS-heavy sites, large crawls |
+| `local` *(default)* | httpx + trafilatura + selectolax | static / well-behaved sites, no API key |
+| `firecrawl` | `FIRECRAWL_API_KEY` | JS-heavy sites, large managed crawls |
 
-## Quick start
+The local backend uses **trafilatura** to strip navigation, ads, and boilerplate
+and emit clean Markdown, then parses `<title>` and anchor links with selectolax.
+
+**3. Chunk (structure-aware).**
+Markdown is split by headings into sections, then packed into ~`target_tokens`
+windows with `overlap_pct` overlap — using the **exact same** `pack_windows` /
+`split_sentences` helpers as Phase 1 (`common/chunking.py`). That's what keeps
+web chunks sized and shaped identically to PDF chunks.
+
+**4. Deduplicate.**
+Near-duplicate pages (shared headers/footers, syndicated content) are collapsed
+with **MinHash LSH** (`datasketch`, Jaccard ≥ 0.9). If the library is absent it
+falls back to exact-text dedup.
+
+**5. Write.**
+Output is the shared `Chunk` schema as JSONL or Parquet, with `source_type="web"`
+and metadata: `url`, `domain`, `title`, `section`. Deterministic `chunk_id` makes
+re-crawls idempotent.
+
+---
+
+## How-to guide
+
+### 1. Install
 ```bash
+git clone https://github.com/ravidsun/arkguru-web-scraping.git
+cd arkguru-web-scraping
+python -m venv .venv && source .venv/bin/activate     # optional
 pip install -r requirements.txt
-# set phase2.seeds in config/config.yaml, then:
-make phase2                            # -> data/processed/web_chunks.jsonl
-# or: python -m phase2_web.pipeline --seeds https://your.site/docs --max-pages 100
+```
+`firecrawl-py` is commented in `requirements.txt`; uncomment it only if you use
+the cloud backend.
+
+### 2. Point it at your site
+Edit `config/config.yaml`:
+```yaml
+phase2:
+  seeds: ["https://your.site/docs"]   # one or more start URLs
+  out_path: "data/processed/web_chunks.jsonl"
+  out_format: "jsonl"                 # jsonl | parquet
+  backend: "local"                    # local | firecrawl
+  firecrawl_api_key_env: "FIRECRAWL_API_KEY"
+  max_pages: 200
+  same_domain_only: true
+  target_tokens: 550
+  overlap_pct: 0.12
+  min_content_chars: 200              # skip near-empty pages
 ```
 
-Two `TODO`s are intentional policy choices left to you: crawl-frontier rules
-(path prefixes, robots.txt, priorities) and the Firecrawl key.
+### 3. Run
+```bash
+make phase2
+# or ad-hoc without editing config:
+python -m phase2_web.pipeline --seeds https://your.site/docs --max-pages 100
+```
+Console shows each URL and its chunk count, then the dedup reduction.
+
+### 4. Use the cloud backend (optional, for JS-heavy sites)
+```bash
+pip install firecrawl-py
+export FIRECRAWL_API_KEY=fc-...
+python -m phase2_web.pipeline --backend firecrawl --config config/config.yaml
+```
+
+### 5. Hand off to Phase 3
+Copy `data/processed/web_chunks.jsonl` into the `arkguru-rag-slm` repo's
+`data/processed/`. It concatenates automatically with the Phase 1 PDF output.
+
+---
+
+## Output schema (`common.schema.Chunk`)
+`text`, `source_type` (`"web"`), `source_id` (URL), `chunk_index`, `title`,
+`section`, `url`, `domain`, `token_count`, `overlap_tokens`, `chunk_id`, `extra`.
+Identical to Phase 1 — that's the whole point.
 
 ## Layout
 ```
@@ -35,3 +110,10 @@ phase2_web/    pipeline.py
 config/        config.yaml
 data/processed/  output chunks
 ```
+
+## Troubleshooting
+- **Blank pages / no content** → site is JS-rendered; switch to the `firecrawl`
+  backend, or raise `min_content_chars` sensitivity.
+- **Crawl wanders off-site** → keep `same_domain_only: true` and lower `max_pages`.
+- **Slow / rate-limited** → reduce `max_pages`; add polite delays in the fetch
+  step; respect robots.txt (the marked `TODO`).
