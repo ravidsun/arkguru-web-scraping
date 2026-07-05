@@ -15,3 +15,5 @@ __all__ = [
     "count_tokens", "truncate_to_tokens",
     "split_sentences", "pack_windows",
 ]
+from .datastore import ChunkStore
+__all__.append("ChunkStore")

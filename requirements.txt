@@ -8,3 +8,6 @@ pyyaml>=6.0
 datasketch>=1.6          # MinHash near-duplicate detection
 # --- cloud-optional ---
 # firecrawl-py>=1.0      # managed crawl/scrape (set FIRECRAWL_API_KEY)
+# --- optional: Postgres + pgvector datastore sink (sink: postgres) ---
+# psycopg[binary]>=3.2
+# pgvector>=0.3

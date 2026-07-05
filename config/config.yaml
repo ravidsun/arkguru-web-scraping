@@ -10,3 +10,8 @@ phase2:
   target_tokens: 550
   overlap_pct: 0.12
   min_content_chars: 200
+  # --- datastore sink (optional; default writes JSONL/Parquet files) ---
+  sink: "file"          # file | postgres
+  pg_dsn_env: "PG_DSN"
+  pg_table: "chunks"
+  pg_dim: 1024

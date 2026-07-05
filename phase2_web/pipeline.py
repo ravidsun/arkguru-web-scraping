@@ -40,6 +40,10 @@ class Phase2Config:
     target_tokens: int = 550
     overlap_pct: float = 0.12
     min_content_chars: int = 200
+    sink: str = "file"                 # file | postgres
+    pg_dsn_env: str = "PG_DSN"
+    pg_table: str = "chunks"
+    pg_dim: int = 1024
 
 
 # --- fetch + extract -------------------------------------------------------
@@ -163,6 +167,13 @@ def run(cfg: Phase2Config) -> list[Chunk]:
     before = len(chunks)
     chunks = _dedup_minhash(chunks)
     log.info("Dedup: %d -> %d", before, len(chunks))
+    if cfg.sink == "postgres":
+        from common.datastore import ChunkStore
+        store = ChunkStore(dsn_env=cfg.pg_dsn_env, table=cfg.pg_table, dim=cfg.pg_dim)
+        store.ensure_schema()
+        n = store.upsert(chunks)
+        log.info("Upserted %d web chunks into the pgvector datastore", n)
+        return chunks
     out = Path(cfg.out_path)
     if cfg.out_format == "parquet":
         write_parquet(chunks, out.with_suffix(".parquet"))
@@ -186,6 +197,7 @@ def main(argv=None):
     ap.add_argument("--out", dest="out_path")
     ap.add_argument("--backend", choices=["local", "firecrawl"])
     ap.add_argument("--max-pages", dest="max_pages", type=int)
+    ap.add_argument("--sink", choices=["file", "postgres"])
     args = ap.parse_args(argv)
     cfg = _load_config(args.config) if args.config else Phase2Config()
     for k, v in vars(args).items():

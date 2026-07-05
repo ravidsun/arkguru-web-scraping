@@ -111,6 +111,18 @@ config/        config.yaml
 data/processed/  output chunks
 ```
 
+## Datastore sink
+
+Write scraped chunks straight into the shared Postgres + pgvector `chunks` table
+(same store Phase 1 uses and Phase 3 embeds), instead of JSONL:
+
+```bash
+export PG_DSN=postgresql://user:pass@localhost:5432/rag
+python -m phase2_web.pipeline --config config/config.yaml --sink postgres
+```
+Idempotent by `chunk_id`; embeddings are filled later in Phase 3. Needs
+`pip install "psycopg[binary]" pgvector`.
+
 ## Troubleshooting
 - **Blank pages / no content** → site is JS-rendered; switch to the `firecrawl`
   backend, or raise `min_content_chars` sensitivity.
