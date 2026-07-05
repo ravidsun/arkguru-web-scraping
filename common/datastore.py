@@ -28,7 +28,10 @@ import json
 import os
 from typing import Iterable, Iterator, Optional
 
+import logging
 from .schema import Chunk
+
+log = logging.getLogger("common.datastore")
 
 # columns of the chunks (source-of-truth) table
 _COLS = ["chunk_id", "text", "source_type", "source_id", "chunk_index",
@@ -65,8 +68,22 @@ class ChunkStore:
 
     # -- schema (two tables) ----------------------------------------------
     def ensure_schema(self) -> None:
-        with self._connect() as conn, conn.cursor() as cur:
+        """Create the two tables + indexes if missing. Idempotent; safe to call on
+        every run. Logs whether each table was created or already present, and
+        raises a clear error if the database is unreachable."""
+        try:
+            conn = self._connect()
+        except Exception as e:
+            raise RuntimeError(
+                "Could not connect to Postgres for the datastore. Check PG_DSN / "
+                "config/datastore.yaml (see docs/DATABASE_SETUP.md). "
+                f"Underlying error: {e}") from e
+        with conn, conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            pre = {}
+            for t in (self.chunks, self.vectors):
+                cur.execute("SELECT to_regclass(%s)", (t,))
+                pre[t] = cur.fetchone()[0] is not None
             # 1) chunks = source of truth (no embedding column)
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {self.chunks} (
@@ -104,6 +121,9 @@ class ChunkStore:
             cur.execute(f"CREATE INDEX IF NOT EXISTS {self.vectors}_hnsw_idx "
                         f"ON {self.vectors} USING hnsw (embedding vector_cosine_ops);")
             conn.commit()
+            for t in (self.chunks, self.vectors):
+                log.info("datastore table '%s': %s", t,
+                         "already present" if pre.get(t) else "created")
 
     # -- write chunks (Phases 1/2) ----------------------------------------
     def upsert(self, chunks: Iterable[Chunk]) -> int:

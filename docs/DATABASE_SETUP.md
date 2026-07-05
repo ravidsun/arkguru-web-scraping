@@ -157,6 +157,13 @@ PY
 
 Expected: the two tables `chunks` and `chunk_embeddings` now exist.
 
+You usually don't even need this: the tables are created automatically the first
+time any phase writes to the database. To create them explicitly, Phase 1 offers:
+
+```bash
+python -m phase1_pdf.pipeline --init-db     # or: make init-db  /  python run_phase1.py --init-db
+```
+
 ---
 
 ## Operating notes
