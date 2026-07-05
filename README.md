@@ -124,6 +124,8 @@ data/processed/  output chunks
 
 ## Datastore sink
 
+> **Setting up the database?** See [docs/DATABASE_SETUP.md](docs/DATABASE_SETUP.md) for step-by-step Postgres + pgvector setup on a local machine (Docker/Homebrew/apt) or a VPS (remote access, firewall, SSL/SSH tunnel).
+
 Write scraped chunks straight into the shared Postgres + pgvector datastore
 instead of JSONL. The datastore keeps **two separate tables**: `chunks` (text +
 metadata) and `chunk_embeddings` (vectors only). Phase 2 writes **only `chunks`**;
