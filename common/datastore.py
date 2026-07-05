@@ -1,24 +1,25 @@
 """
-Postgres + pgvector chunk store -- the single datastore for the whole pipeline.
+Postgres + pgvector datastore -- TWO tables, cleanly separated:
 
-Phases 1 & 2 UPSERT chunks here (text + metadata, embedding left NULL). Phase 3
-fills embeddings IN PLACE and runs hybrid search over the same table. One system
-is both the system-of-record for chunks and the vector index.
+  1. <chunks_table>      (default "chunks")           -- the chunk text + metadata.
+     This is the JSONL-equivalent SOURCE OF TRUTH. No vectors here.
+  2. <vectors_table>     (default "chunk_embeddings")  -- the embeddings only,
+     keyed by chunk_id (FK -> chunks, ON DELETE CASCADE), with the HNSW index.
 
-Why one table: embeddings are disposable and model-specific; chunks are the
-durable source of truth. Keeping them together (embedding nullable) means you can
-re-embed with a different model anytime without re-extracting, and non-retrieval
-consumers (fine-tune dataset prep) read the same rows.
+Why separate:
+  - Embeddings are disposable & model-specific; chunk text/metadata is durable.
+    Re-embed with a different model by truncating one table -- chunks untouched.
+  - Phases 1 & 2 write ONLY the chunks table (no embedding model needed).
+    Phase 3 fills the vectors table in place.
+  - Lexical/full-text search lives on the chunks table; dense search JOINs the
+    vectors table. Retrieval fuses both.
 
-Design:
-  - upsert() is idempotent by chunk_id (ON CONFLICT). Re-ingesting the same PDFs
-    is a no-op; new PDFs just add rows. Perfect for iterative corpora.
-  - upsert() never clobbers an existing embedding unless you pass one.
-  - A generated tsvector column gives lexical/BM25-style search for free.
-  - HNSW cosine index is created on the embedding column for fast ANN.
+Phase flow:
+    Phase 1/2  -> upsert()             -> chunks table (vectors table stays empty)
+    Phase 3    -> update_embeddings()  -> chunk_embeddings table
+    retrieve   -> search_dense()/search_lexical() (JOIN when dense)
 
 Requires:  pip install "psycopg[binary]" pgvector
-Set the DSN via env (default PG_DSN), e.g.
     export PG_DSN=postgresql://user:pass@localhost:5432/rag
 """
 from __future__ import annotations
@@ -29,21 +30,26 @@ from typing import Iterable, Iterator, Optional
 
 from .schema import Chunk
 
-# columns persisted as first-class (everything else rides in meta jsonb)
+# columns of the chunks (source-of-truth) table
 _COLS = ["chunk_id", "text", "source_type", "source_id", "chunk_index",
          "title", "section", "page", "url", "domain", "lang",
          "parent_id", "is_parent", "token_count", "overlap_tokens"]
 
+# columns returned to retrieval callers
+_HIT_COLS = ["chunk_id", "text", "section", "source_id", "page", "url", "parent_id"]
+
 
 class ChunkStore:
     def __init__(self, dsn: Optional[str] = None, table: str = "chunks",
-                 dim: int = 1024, dsn_env: str = "PG_DSN"):
+                 vectors_table: str = "chunk_embeddings", dim: int = 1024,
+                 dsn_env: str = "PG_DSN"):
         self.dsn = dsn or os.environ.get(dsn_env)
         if not self.dsn:
             raise ValueError(
                 f"No Postgres DSN. Pass dsn=... or set ${dsn_env}, e.g. "
                 "postgresql://user:pass@localhost:5432/rag")
-        self.table = table
+        self.chunks = table
+        self.vectors = vectors_table
         self.dim = dim
 
     # -- connection --------------------------------------------------------
@@ -51,19 +57,19 @@ class ChunkStore:
         import psycopg
         from pgvector.psycopg import register_vector
         conn = psycopg.connect(self.dsn)
-        # register_vector needs the extension to exist; ensure_schema does that.
         try:
             register_vector(conn)
         except Exception:
             pass
         return conn
 
-    # -- schema ------------------------------------------------------------
+    # -- schema (two tables) ----------------------------------------------
     def ensure_schema(self) -> None:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            # 1) chunks = source of truth (no embedding column)
             cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {self.table} (
+                CREATE TABLE IF NOT EXISTS {self.chunks} (
                     chunk_id     text PRIMARY KEY,
                     text         text NOT NULL,
                     source_type  text,
@@ -79,51 +85,56 @@ class ChunkStore:
                     is_parent    boolean DEFAULT false,
                     token_count  int,
                     overlap_tokens int DEFAULT 0,
-                    embedding    vector({self.dim}),
                     meta         jsonb DEFAULT '{{}}'::jsonb,
                     ts           tsvector GENERATED ALWAYS AS
                                  (to_tsvector('english', coalesce(text,''))) STORED,
                     created_at   timestamptz DEFAULT now()
                 );""")
-            cur.execute(f"CREATE INDEX IF NOT EXISTS {self.table}_ts_idx "
-                        f"ON {self.table} USING gin(ts);")
-            # HNSW only helps non-null rows; build it once embeddings exist.
-            cur.execute(f"CREATE INDEX IF NOT EXISTS {self.table}_vec_idx "
-                        f"ON {self.table} USING hnsw (embedding vector_cosine_ops);")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS {self.chunks}_ts_idx "
+                        f"ON {self.chunks} USING gin(ts);")
+            # 2) vectors = embeddings only, keyed to chunks
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self.vectors} (
+                    chunk_id   text PRIMARY KEY
+                               REFERENCES {self.chunks}(chunk_id) ON DELETE CASCADE,
+                    embedding  vector({self.dim}),
+                    model      text,
+                    created_at timestamptz DEFAULT now()
+                );""")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS {self.vectors}_hnsw_idx "
+                        f"ON {self.vectors} USING hnsw (embedding vector_cosine_ops);")
             conn.commit()
 
-    # -- write -------------------------------------------------------------
+    # -- write chunks (Phases 1/2) ----------------------------------------
     def upsert(self, chunks: Iterable[Chunk]) -> int:
-        """Insert new chunks / update text+metadata for existing chunk_ids.
-
-        Idempotent. Existing embeddings are preserved (embedding not overwritten
-        here). Returns number of rows affected.
-        """
+        """Insert/update chunk rows (source of truth). Idempotent by chunk_id.
+        Does NOT touch the vectors table."""
         rows = []
         for c in chunks:
             d = c.to_dict()
-            meta = d.get("extra") or {}
-            rows.append(tuple(d.get(k) for k in _COLS) + (json.dumps(meta),))
+            rows.append(tuple(d.get(k) for k in _COLS) + (json.dumps(d.get("extra") or {}),))
         if not rows:
             return 0
         placeholders = ",".join(["%s"] * (len(_COLS) + 1))
         collist = ",".join(_COLS + ["meta"])
         updates = ",".join(f"{k}=EXCLUDED.{k}" for k in _COLS if k != "chunk_id")
-        sql = (f"INSERT INTO {self.table} ({collist}) VALUES ({placeholders}) "
+        sql = (f"INSERT INTO {self.chunks} ({collist}) VALUES ({placeholders}) "
                f"ON CONFLICT (chunk_id) DO UPDATE SET {updates}, meta=EXCLUDED.meta")
         with self._connect() as conn, conn.cursor() as cur:
             cur.executemany(sql, rows)
             conn.commit()
             return len(rows)
 
-    # -- embeddings --------------------------------------------------------
+    # -- embeddings (Phase 3) ---------------------------------------------
     def iter_missing_embeddings(self, batch: int = 256
                                 ) -> Iterator[list[tuple[str, str]]]:
-        """Yield batches of (chunk_id, text) for rows with no embedding yet."""
+        """Yield (chunk_id, text) for chunks that have no row in the vectors table."""
         with self._connect() as conn, conn.cursor(name="missing") as cur:
             cur.itersize = batch
-            cur.execute(f"SELECT chunk_id, text FROM {self.table} "
-                        f"WHERE embedding IS NULL AND is_parent = false")
+            cur.execute(
+                f"SELECT c.chunk_id, c.text FROM {self.chunks} c "
+                f"LEFT JOIN {self.vectors} v ON c.chunk_id = v.chunk_id "
+                f"WHERE v.chunk_id IS NULL AND c.is_parent = false")
             buf = []
             for row in cur:
                 buf.append((row[0], row[1]))
@@ -132,26 +143,38 @@ class ChunkStore:
             if buf:
                 yield buf
 
-    def update_embeddings(self, ids: list[str], vectors) -> int:
+    def update_embeddings(self, ids: list[str], vectors, model: Optional[str] = None) -> int:
+        """Upsert embeddings into the vectors table (keyed by chunk_id)."""
         with self._connect() as conn, conn.cursor() as cur:
             for cid, vec in zip(ids, vectors):
                 v = vec.tolist() if hasattr(vec, "tolist") else list(vec)
-                cur.execute(f"UPDATE {self.table} SET embedding=%s WHERE chunk_id=%s",
-                            (v, cid))
+                cur.execute(
+                    f"INSERT INTO {self.vectors} (chunk_id, embedding, model) "
+                    f"VALUES (%s, %s, %s) ON CONFLICT (chunk_id) DO UPDATE "
+                    f"SET embedding = EXCLUDED.embedding, model = EXCLUDED.model, "
+                    f"created_at = now()", (cid, v, model))
             conn.commit()
             return len(ids)
 
-    # -- read --------------------------------------------------------------
+    # -- counts / reads ----------------------------------------------------
     def count(self, only_missing_embedding: bool = False) -> int:
-        q = f"SELECT count(*) FROM {self.table}"
         if only_missing_embedding:
-            q += " WHERE embedding IS NULL"
+            q = (f"SELECT count(*) FROM {self.chunks} c "
+                 f"LEFT JOIN {self.vectors} v ON c.chunk_id = v.chunk_id "
+                 f"WHERE v.chunk_id IS NULL AND c.is_parent = false")
+        else:
+            q = f"SELECT count(*) FROM {self.chunks}"
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(q)
             return cur.fetchone()[0]
 
+    def count_vectors(self) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {self.vectors}")
+            return cur.fetchone()[0]
+
     def read_all(self, include_parents: bool = True) -> list[Chunk]:
-        q = f"SELECT {','.join(_COLS)}, meta FROM {self.table}"
+        q = f"SELECT {','.join(_COLS)}, meta FROM {self.chunks}"
         if not include_parents:
             q += " WHERE is_parent = false"
         with self._connect() as conn, conn.cursor() as cur:
@@ -162,3 +185,26 @@ class ChunkStore:
                 d["extra"] = row[-1] or {}
                 out.append(Chunk.from_dict(d))
             return out
+
+    # -- search (Phase 3 retrieval) ---------------------------------------
+    def search_dense(self, qvec, k: int = 20) -> list[tuple]:
+        """Cosine NN over the vectors table, JOINed back to chunk text/metadata."""
+        cols = ",".join(f"c.{x}" for x in _HIT_COLS)
+        vec = "[" + ",".join(str(float(x)) for x in qvec) + "]"   # pgvector literal
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {cols}, 1 - (v.embedding <=> %s::vector) AS score "
+                f"FROM {self.vectors} v JOIN {self.chunks} c ON c.chunk_id = v.chunk_id "
+                f"ORDER BY v.embedding <=> %s::vector LIMIT %s", (vec, vec, k))
+            return cur.fetchall()
+
+    def search_lexical(self, query: str, k: int = 20) -> list[tuple]:
+        """Full-text (BM25-like) search over the chunks table."""
+        cols = ",".join(f"c.{x}" for x in _HIT_COLS)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {cols}, ts_rank(c.ts, plainto_tsquery('english', %s)) AS score "
+                f"FROM {self.chunks} c "
+                f"WHERE c.ts @@ plainto_tsquery('english', %s) "
+                f"ORDER BY score DESC LIMIT %s", (query, query, k))
+            return cur.fetchall()

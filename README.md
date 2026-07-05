@@ -124,8 +124,10 @@ data/processed/  output chunks
 
 ## Datastore sink
 
-Write scraped chunks straight into the shared Postgres + pgvector `chunks` table
-(same store Phase 1 uses and Phase 3 embeds), instead of JSONL:
+Write scraped chunks straight into the shared Postgres + pgvector datastore
+instead of JSONL. The datastore keeps **two separate tables**: `chunks` (text +
+metadata) and `chunk_embeddings` (vectors only). Phase 2 writes **only `chunks`**;
+Phase 3 fills the vectors later.
 
 ```bash
 export PG_DSN=postgresql://user:pass@localhost:5432/rag
