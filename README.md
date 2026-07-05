@@ -75,6 +75,11 @@ phase2:
   target_tokens: 550
   overlap_pct: 0.12
   min_content_chars: 200              # skip near-empty pages
+  # --- datastore sink (optional; default writes JSONL/Parquet files) ---
+  sink: "file"                        # file | postgres
+  pg_dsn_env: "PG_DSN"
+  pg_table: "chunks"
+  pg_dim: 1024
 ```
 
 ### 3. Run
@@ -93,8 +98,14 @@ python -m phase2_web.pipeline --backend firecrawl --config config/config.yaml
 ```
 
 ### 5. Hand off to Phase 3
-Copy `data/processed/web_chunks.jsonl` into the `arkguru-rag-slm` repo's
-`data/processed/`. It concatenates automatically with the Phase 1 PDF output.
+Two options:
+
+- **Files (default).** Copy `data/processed/web_chunks.jsonl` into the
+  `arkguru-rag-slm` repo's `data/processed/`. It concatenates automatically with
+  the Phase 1 PDF output.
+- **Shared datastore (no copying).** Run with `--sink postgres` (see *Datastore
+  sink* below) so chunks land in the same Postgres + pgvector table Phase 3
+  reads. Phase 3 fills embeddings in place.
 
 ---
 
