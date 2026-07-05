@@ -1,0 +1,29 @@
+# =============================================================================
+# Datastore configuration -- the ONE place that decides where chunks + vectors
+# live. Shared by all phases (vendored common/datastore_config.py reads this).
+# Switch backends or databases here; no code changes needed.
+#
+# Secrets stay OUT of git: the DSN is read from an environment variable by
+# default (dsn_env). Set it once, e.g.:
+#     export PG_DSN=postgresql://user:pass@localhost:5432/rag
+# Or copy .env.example -> .env and fill it in.
+# =============================================================================
+datastore:
+  # backend used when a phase's sink is "postgres" (Phase 1/2) or by Phase 3:
+  backend: postgres          # postgres | file | local
+
+  postgres:
+    dsn_env: PG_DSN          # read connection string from this env var (preferred)
+    dsn: null                # or hardcode here (NOT recommended for secrets)
+    chunks_table: chunks             # source-of-truth: text + metadata
+    vectors_table: chunk_embeddings  # separate table: vectors only
+    dim: 1024                # embedding dimension (bge-m3=1024, e5=1024, MiniLM=384)
+
+  # used when a phase writes files instead of a database (sink: file)
+  file:
+    out_dir: data/processed
+    out_format: jsonl        # jsonl | parquet
+
+  # used by Phase 3's no-server local vector store (quickstart / testing)
+  local:
+    path: data/store/index

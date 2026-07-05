@@ -133,6 +133,12 @@ Phase 3 fills the vectors later.
 export PG_DSN=postgresql://user:pass@localhost:5432/rag
 python -m phase2_web.pipeline --config config/config.yaml --sink postgres
 ```
+**All datastore settings live in one place — `config/datastore.yaml`** (DSN via
+the `PG_DSN` env var, table names, and embedding dim). No connection details are
+hardcoded in code. To switch database or tables, edit that one file; to switch
+the connection, set `PG_DSN` (or copy `.env.example` → `.env`). Env vars
+(`PG_DSN`, `DATASTORE_BACKEND`, `DATASTORE_CONFIG`) override the file.
+
 Idempotent by `chunk_id`; embeddings are filled later in Phase 3. Needs
 `pip install "psycopg[binary]" pgvector`.
 

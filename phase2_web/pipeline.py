@@ -41,9 +41,7 @@ class Phase2Config:
     overlap_pct: float = 0.12
     min_content_chars: int = 200
     sink: str = "file"                 # file | postgres
-    pg_dsn_env: str = "PG_DSN"
-    pg_table: str = "chunks"
-    pg_dim: int = 1024
+    datastore_config: str = "config/datastore.yaml"
 
 
 # --- fetch + extract -------------------------------------------------------
@@ -168,8 +166,8 @@ def run(cfg: Phase2Config) -> list[Chunk]:
     chunks = _dedup_minhash(chunks)
     log.info("Dedup: %d -> %d", before, len(chunks))
     if cfg.sink == "postgres":
-        from common.datastore import ChunkStore
-        store = ChunkStore(dsn_env=cfg.pg_dsn_env, table=cfg.pg_table, dim=cfg.pg_dim)
+        from common.datastore_config import open_chunk_store
+        store = open_chunk_store(cfg.datastore_config)
         store.ensure_schema()
         n = store.upsert(chunks)
         log.info("Upserted %d web chunks into the pgvector datastore", n)

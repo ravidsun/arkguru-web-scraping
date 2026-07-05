@@ -8,3 +8,5 @@ artifacts/
 *.gguf
 *.parquet
 .venv/
+
+.env
