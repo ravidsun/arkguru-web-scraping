@@ -144,6 +144,19 @@ the connection, set `PG_DSN` (or copy `.env.example` → `.env`). Env vars
 Idempotent by `chunk_id`; embeddings are filled later in Phase 3. Needs
 `pip install "psycopg[binary]" pgvector`.
 
+## Autonomous worker
+
+Run Phase 2 as a scheduled crawler (the trigger is the clock; no LLM). Each cycle
+re-crawls the configured seeds; idempotent upserts mean only changed content is
+refreshed.
+
+```bash
+python -m phase2_web.worker --once
+python -m phase2_web.worker --interval 3600    # hourly  (make worker)
+python -m phase2_web.worker --sink postgres --interval 21600
+```
+Coordinated with Phases 1 & 3 by the orchestrator in `arkguru-rag-slm`.
+
 ## Troubleshooting
 - **Blank pages / no content** → site is JS-rendered; switch to the `firecrawl`
   backend, or raise `min_content_chars` sensitivity.

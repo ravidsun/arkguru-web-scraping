@@ -19,3 +19,5 @@ from .datastore import ChunkStore
 __all__.append("ChunkStore")
 from .datastore_config import load_datastore_config, open_chunk_store, resolve_dsn
 __all__ += ["load_datastore_config", "open_chunk_store", "resolve_dsn"]
+from .worker import Worker, FolderState
+__all__ += ["Worker", "FolderState"]
