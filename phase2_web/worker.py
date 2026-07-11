@@ -35,7 +35,8 @@ def main(argv=None):
     if a.seeds: cfg.seeds = a.seeds
     if a.sink: cfg.sink = a.sink
     if not cfg.seeds:
-        log.error("No seeds configured. Set phase2.seeds or pass --seeds."); return 1
+        log.warning("No seeds configured; nothing to crawl (Phase 2 is a no-op).")
+        return 0
 
     def run_once():
         chunks = run(cfg)
