@@ -157,6 +157,18 @@ python -m phase2_web.worker --sink postgres --interval 21600
 ```
 Coordinated with Phases 1 & 3 by the orchestrator in `arkguru-rag-slm`.
 
+## Running on a separate machine
+
+Crawling can run on any box (e.g. a cloud VM close to the sites) and write to a
+shared datastore that a different machine serves from:
+```bash
+export PG_DSN="postgresql://rag:pass@db-host:5432/rag?sslmode=require"
+python -m phase2_web.worker --sink postgres --interval 3600
+```
+The serving side (arkguru-rag-slm) reads the same database — no files move. See the
+deployment topologies in the `arkguru-rag-slm` README and
+[docs/DATABASE_SETUP.md](docs/DATABASE_SETUP.md).
+
 ## Troubleshooting
 - **Blank pages / no content** → site is JS-rendered; switch to the `firecrawl`
   backend, or raise `min_content_chars` sensitivity.
