@@ -144,9 +144,65 @@ the connection, set `PG_DSN` (or copy `.env.example` → `.env`). Env vars
 Idempotent by `chunk_id`; embeddings are filled later in Phase 3. Needs
 `pip install "psycopg[binary]" pgvector`.
 
+## Backend comparison in detail
+
+### Local backend (trafilatura)
+- **Pros:** No API key, runs anywhere, full control, can be rate-limited to respect site policies
+- **Cons:** Doesn't handle JavaScript-heavy sites (returns blank or boilerplate), fails on sites with aggressive anti-bot detection
+- **Best for:** Documentation sites, static blogs, traditional CMSs (WordPress, etc.), internal wikis
+- **Speed:** ~200–500 ms per page (including network + parsing)
+
+### Firecrawl backend
+- **Pros:** Handles dynamic JS-rendered content, waits for page load, built-in anti-bot evasion
+- **Cons:** Requires API key + paid plan, rate-limited, cloud dependency
+- **Best for:** Single-page apps, JavaScript frameworks (React, Vue), sites with render-on-scroll, news/media sites
+- **Speed:** ~1–3 s per page (cloud service overhead), priced per crawl
+
+**Decision tree:** Start with `local` (free, offline). If you see blank pages or only navigation elements, switch to `firecrawl` for that site or add it to a separate crawl with that backend.
+
+## Configuration deep dive
+
+### Crawl frontier (`seeds`, `max_pages`, `same_domain_only`)
+- `seeds`: list of entry URLs (can be multiple to start multiple crawls in one run)
+- `max_pages`: hard cap on total pages visited; reached first page after hitting this limit is dropped
+- `same_domain_only`: if `true`, any discovered links not on `seeds` domain are dropped. Set to `false` to crawl cross-domain (e.g., `docs.example.com` → `example.com` → `blog.example.com`). Use `false` cautiously; crawl explosion is real.
+
+**Example: crawl documentation + blog in one run:**
+```yaml
+phase2:
+  seeds: ["https://docs.example.com", "https://blog.example.com"]
+  same_domain_only: false   # allows crawl to move between subdomains
+  max_pages: 500
+```
+
+### Content filtering (`min_content_chars`, `target_tokens`)
+- `min_content_chars`: skip pages with less text (helps exclude nav-only or empty pages)
+- `target_tokens`: chunk size in tokens; keep 400–550 for retrieval, 600+ for training
+
+### Deduplication sensitivity
+Exact dedup (text match) is always run. Near-dedup via MinHash (if `datasketch` is installed) collapses pages sharing ≥90% content (common for syndicated news, paginated lists). If dedup removes too many pages:
+```bash
+pip uninstall datasketch     # falls back to exact-match only
+```
+
 ## Troubleshooting
-- **Blank pages / no content** → site is JS-rendered; switch to the `firecrawl`
-  backend, or raise `min_content_chars` sensitivity.
-- **Crawl wanders off-site** → keep `same_domain_only: true` and lower `max_pages`.
-- **Slow / rate-limited** → reduce `max_pages`; add polite delays in the fetch
-  step; respect robots.txt (the marked `TODO`).
+
+### Blank pages / no content
+→ site is JS-rendered; switch to the `firecrawl` backend, or raise `min_content_chars` sensitivity. You can also check a single URL manually:
+```python
+from phase2_web.fetch import fetch_local
+markdown, title, links = fetch_local("https://your.site/page")
+print(markdown[:500])  # inspect first 500 chars
+```
+
+### Crawl wanders off-site
+→ keep `same_domain_only: true` and lower `max_pages`. If you intentionally want cross-domain crawl, set `same_domain_only: false` and use a tighter `max_pages` (e.g., 100 instead of 500).
+
+### Slow / rate-limited
+→ reduce `max_pages`; add polite delays in the fetch step (modify `fetch.py`); respect robots.txt (the marked `TODO` in `pipeline.py`). If using firecrawl, contact their support to increase rate limits.
+
+### Extracted markdown is malformed
+→ trafilatura occasionally over-strips or misparses complex HTML. For that domain, try firecrawl instead. If problem persists, open an issue with the URL and problematic output.
+
+### Memory usage grows unbounded
+→ crawl frontier queue grows with each page's discovered links. Limit `max_pages` or reduce `same_domain_only` scope. For corpora >10K pages, consider chunking into multiple runs (e.g., crawl `/docs` separately from `/blog`).
