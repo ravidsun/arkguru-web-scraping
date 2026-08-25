@@ -9,16 +9,14 @@ drop-in cloud option for JS-heavy sites or large crawls.
 
 Independent of Phase 1: different inputs (URLs), same outputs (chunks), so
 Phase 3 concatenates both without any glue.
-
-DESIGN IS COMPLETE; two spots are marked TODO where you plug in your crawl
-frontier policy and (optionally) your Firecrawl key.
 """
 from __future__ import annotations
 
-import argparse, logging, os, re, sys
+import argparse, logging, os, re, sys, time
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urlunparse
+from urllib.robotparser import RobotFileParser
 
 from common.schema import Chunk, write_jsonl, write_parquet
 from common.tokenizer import count_tokens
@@ -42,15 +40,21 @@ class Phase2Config:
     min_content_chars: int = 200
     sink: str = "file"                 # file | postgres
     datastore_config: str = "config/datastore.yaml"
+    # --- crawl frontier ---
+    allow_path_prefixes: list[str] = field(default_factory=list)
+    deny_path_prefixes: list[str] = field(default_factory=list)
+    respect_robots: bool = True
+    crawl_delay_s: float = 0.25
+    user_agent: str = "domain-rag/1.0"
 
 
 # --- fetch + extract -------------------------------------------------------
-def _fetch_local(url: str) -> tuple[str, str, list[str]]:
+def _fetch_local(url: str, user_agent: str = "domain-rag/1.0") -> tuple[str, str, list[str]]:
     """Return (markdown_text, title, discovered_links). Local, no API key."""
     import httpx, trafilatura
     from selectolax.parser import HTMLParser
     html = httpx.get(url, timeout=20, follow_redirects=True,
-                     headers={"User-Agent": "domain-rag/1.0"}).text
+                     headers={"User-Agent": user_agent}).text
     text = trafilatura.extract(html, include_comments=False, include_tables=True,
                                output_format="markdown") or ""
     tree = HTMLParser(html)
@@ -60,28 +64,179 @@ def _fetch_local(url: str) -> tuple[str, str, list[str]]:
     return text, title.strip(), links
 
 
-def _fetch_firecrawl(url: str) -> tuple[str, str, list[str]]:
-    """Cloud backend. Needs FIRECRAWL_API_KEY. Returns clean markdown directly."""
-    from firecrawl import FirecrawlApp
-    app = FirecrawlApp(api_key=os.environ[cfg_key_env])  # set below
-    res = app.scrape_url(url, params={"formats": ["markdown", "links"]})
-    return res.get("markdown", ""), res.get("metadata", {}).get("title", ""), res.get("links", [])
+def _as_dict(res) -> dict:
+    if isinstance(res, dict):
+        return res
+    out = {}
+    for key in ("markdown", "links", "metadata"):
+        if hasattr(res, key):
+            out[key] = getattr(res, key)
+    data = getattr(res, "data", None)
+    if data is not None:
+        if isinstance(data, dict):
+            out.update(data)
+        else:
+            for key in ("markdown", "links", "metadata"):
+                if hasattr(data, key):
+                    out[key] = getattr(data, key)
+    return out
 
 
-cfg_key_env = "FIRECRAWL_API_KEY"
+def _fetch_firecrawl(url: str, api_key: str) -> tuple[str, str, list[str]]:
+    """Cloud backend. Needs an API key from firecrawl_api_key_env."""
+    try:
+        from firecrawl import FirecrawlApp
+        app = FirecrawlApp(api_key=api_key)
+    except ImportError:
+        try:
+            from firecrawl import Firecrawl
+            app = Firecrawl(api_key=api_key)
+        except ImportError as e:
+            raise RuntimeError(
+                "firecrawl-py is required for backend=firecrawl. "
+                "pip install firecrawl-py"
+            ) from e
+    scrape = getattr(app, "scrape_url", None) or getattr(app, "scrape")
+    try:
+        res = scrape(url, params={"formats": ["markdown", "links"]})
+    except TypeError:
+        res = scrape(url, formats=["markdown", "links"])
+    data = _as_dict(res)
+    meta = data.get("metadata") or {}
+    if not isinstance(meta, dict):
+        meta = dict(meta) if meta else {}
+    links = data.get("links") or []
+    if isinstance(links, dict):
+        links = list(links.values())
+    return data.get("markdown") or "", meta.get("title") or "", list(links)
+
+
+_SKIP_SUFFIXES = (
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".gz", ".tgz", ".rar", ".7z",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+    ".css", ".js", ".mjs", ".map", ".woff", ".woff2", ".ttf", ".eot",
+    ".mp4", ".mp3", ".avi", ".mov", ".wav",
+)
+
+
+def normalize_url(url: str) -> str | None:
+    """Strip fragments, default ports, and trailing slashes (except root)."""
+    try:
+        p = urlparse(url.strip())
+    except Exception:
+        return None
+    if p.scheme not in ("http", "https") or not p.netloc:
+        return None
+    host = (p.hostname or "").lower()
+    if not host:
+        return None
+    port = p.port
+    if port in (80, 443, None):
+        netloc = host
+    else:
+        netloc = f"{host}:{port}"
+    path = p.path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+    query = p.query
+    return urlunparse((p.scheme, netloc, path, "", query, ""))
+
+
+def _path_ok(path: str, allow: list[str], deny: list[str]) -> bool:
+    path = path or "/"
+
+    def matches(prefix: str) -> bool:
+        p = prefix if prefix.startswith("/") else "/" + prefix
+        p = p.rstrip("/") or "/"
+        return path == p or path.startswith(p + "/")
+
+    if any(matches(prefix) for prefix in deny):
+        return False
+    if not allow:
+        return True
+    return any(matches(prefix) for prefix in allow)
+
+
+class _RobotsCache:
+    def __init__(self, user_agent: str):
+        self.user_agent = user_agent
+        self._parsers: dict[str, RobotFileParser | None] = {}
+
+    def allowed(self, url: str) -> bool:
+        p = urlparse(url)
+        origin = f"{p.scheme}://{p.netloc}"
+        if origin not in self._parsers:
+            rp = RobotFileParser()
+            rp.set_url(urljoin(origin + "/", "robots.txt"))
+            try:
+                rp.read()
+                self._parsers[origin] = rp
+            except Exception:
+                self._parsers[origin] = None
+                return True
+        rp = self._parsers[origin]
+        if rp is None:
+            return True
+        try:
+            return rp.can_fetch(self.user_agent, url)
+        except Exception:
+            return True
+
+
+def _frontier_priority(url: str) -> tuple[int, int, str]:
+    """Lower tuple sorts first: fewer path segments, then shorter URL."""
+    path = urlparse(url).path or "/"
+    segments = [s for s in path.split("/") if s]
+    return (len(segments), len(url), url)
+
+
+def should_enqueue(url: str, cfg: Phase2Config, seed_domains: set[str]) -> bool:
+    """Apply domain, suffix, and path-prefix filters (robots checked at fetch time)."""
+    parsed = urlparse(url)
+    if cfg.same_domain_only and parsed.netloc not in seed_domains:
+        return False
+    path_lower = (parsed.path or "").lower()
+    if any(path_lower.endswith(ext) for ext in _SKIP_SUFFIXES):
+        return False
+    if not _path_ok(parsed.path or "/", cfg.allow_path_prefixes, cfg.deny_path_prefixes):
+        return False
+    return True
 
 
 # --- crawl frontier --------------------------------------------------------
 def _crawl(cfg: Phase2Config):
     from collections import deque
     seen: set[str] = set()
-    q = deque(cfg.seeds)
-    seed_domains = {urlparse(s).netloc for s in cfg.seeds}
-    fetch = _fetch_firecrawl if cfg.backend == "firecrawl" else _fetch_local
+    seed_urls = []
+    for s in cfg.seeds:
+        n = normalize_url(s)
+        if n:
+            seed_urls.append(n)
+    q: deque[str] = deque(seed_urls)
+    seed_domains = {urlparse(s).netloc for s in seed_urls}
+    robots = _RobotsCache(cfg.user_agent) if cfg.respect_robots else None
+
+    if cfg.backend == "firecrawl":
+        api_key = os.environ.get(cfg.firecrawl_api_key_env, "").strip()
+        if not api_key:
+            raise RuntimeError(
+                f"Firecrawl backend requires ${cfg.firecrawl_api_key_env}. "
+                "Set the env var or switch backend to 'local'."
+            )
+        def fetch(url: str):
+            return _fetch_firecrawl(url, api_key)
+    else:
+        def fetch(url: str):
+            return _fetch_local(url, cfg.user_agent)
 
     while q and len(seen) < cfg.max_pages:
         url = q.popleft()
         if url in seen:
+            continue
+        if robots and not robots.allowed(url):
+            log.info("robots.txt disallows %s", url)
+            seen.add(url)
             continue
         seen.add(url)
         try:
@@ -89,15 +244,21 @@ def _crawl(cfg: Phase2Config):
         except Exception as e:
             log.warning("fetch failed %s: %s", url, e)
             continue
+        if cfg.crawl_delay_s > 0:
+            time.sleep(cfg.crawl_delay_s)
         if len(text) >= cfg.min_content_chars:
             yield url, title, text
-        # TODO: refine frontier policy (path prefixes, robots.txt, priorities)
+        discovered: list[str] = []
         for link in links:
-            if link in seen:
+            n = normalize_url(link)
+            if not n or n in seen:
                 continue
-            if cfg.same_domain_only and urlparse(link).netloc not in seed_domains:
+            if not should_enqueue(n, cfg, seed_domains):
                 continue
-            q.append(link)
+            discovered.append(n)
+        discovered.sort(key=_frontier_priority)
+        for n in discovered:
+            q.append(n)
 
 
 # --- HTML markdown -> chunks (structure-aware, same packer as Phase 1) ------
@@ -154,8 +315,6 @@ def _dedup_minhash(chunks: list[Chunk], threshold: float = 0.9) -> list[Chunk]:
 
 
 def run(cfg: Phase2Config) -> list[Chunk]:
-    global cfg_key_env
-    cfg_key_env = cfg.firecrawl_api_key_env
     chunks, idx = [], 0
     for url, title, md in _crawl(cfg):
         pc = _page_to_chunks(url, title, md, cfg, idx)

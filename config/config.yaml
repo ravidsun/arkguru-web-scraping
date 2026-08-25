@@ -10,6 +10,11 @@ phase2:
   target_tokens: 550
   overlap_pct: 0.12
   min_content_chars: 200
+  allow_path_prefixes: []    # e.g. ["/docs"] — empty means allow all paths
+  deny_path_prefixes: []     # e.g. ["/blog", "/tag"]
+  respect_robots: true
+  crawl_delay_s: 0.25
+  user_agent: "domain-rag/1.0"
   # --- datastore sink (optional; default writes JSONL/Parquet files) ---
   sink: "file"          # file | postgres  (connection/tables -> config/datastore.yaml)
   datastore_config: "config/datastore.yaml"
