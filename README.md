@@ -1,8 +1,8 @@
 # arkguru-web-scraping — Phase 2
 
 Crawl websites and convert them into the **same** `Chunk` records as Phase 1, so
-both feed Phase 3 with zero conversion. Independent process (different inputs —
-URLs instead of PDFs), identical output schema. **Local-first, cloud-optional.**
+both feed Phase 3 with zero conversion. **Optional** if you only have PDFs.
+Independent process (URLs instead of PDFs), identical output schema.
 Part of a 3-repo system with
 [`arkguru-pdf-extraction`](https://github.com/ravidsun/arkguru-pdf-extraction)
 (Phase 1) and
@@ -77,9 +77,7 @@ phase2:
   min_content_chars: 200              # skip near-empty pages
   # --- datastore sink (optional; default writes JSONL/Parquet files) ---
   sink: "file"                        # file | postgres
-  pg_dsn_env: "PG_DSN"
-  pg_table: "chunks"
-  pg_dim: 1024
+  datastore_config: "config/datastore.yaml"
 ```
 
 ### 3. Run
@@ -141,8 +139,8 @@ hardcoded in code. To switch database or tables, edit that one file; to switch
 the connection, set `PG_DSN` (or copy `.env.example` → `.env`). Env vars
 (`PG_DSN`, `DATASTORE_BACKEND`, `DATASTORE_CONFIG`) override the file.
 
-Idempotent by `chunk_id`; embeddings are filled later in Phase 3. Needs
-`pip install "psycopg[binary]" pgvector`.
+Idempotent by `chunk_id` (conflict upsert does not reset `created_at`). Embeddings
+are filled later in Phase 3. Needs `pip install "psycopg[binary]" pgvector`.
 
 ## Backend comparison in detail
 
